@@ -20,10 +20,14 @@ clean:
 
 install: all
 	@echo "############################################################"
-	@echo "# WARNING: this installs to $(MODULE_DIR)"
-	@echo "# depmod searches extra/ BEFORE kernel/, and DKMS installs"
-	@echo "# to kernel/sound/usb/. A module left here will shadow every"
-	@echo "# future DKMS build, including rebuilds after kernel updates."
+	@echo "# WARNING: this installs katana_usb_audio.ko into"
+	@echo "#   $(MODULE_DIR)"
+	@echo "# On Red Hat based distros DKMS installs there too (it"
+	@echo "# overrides DEST_MODULE_LOCATION from dkms.conf), as"
+	@echo "# katana_usb_audio.ko.xz. Two copies of one module in one"
+	@echo "# directory leaves it to depmod which one wins, so a stray"
+	@echo "# 'make install' can quietly outlive every later DKMS"
+	@echo "# rebuild, including those after a kernel update."
 	@echo "#"
 	@echo "# Use 'make dkms-install' instead unless you know why you"
 	@echo "# want this. To undo later: 'make uninstall'."

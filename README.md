@@ -4,6 +4,10 @@ A specialized Linux kernel driver for the Creative SoundBlaster X Katana USB spe
 
 **Current state**: Full functionality including USB audio streaming, hardware volume controls, mute functionality, and proper ALSA integration.
 
+**Based on**: [mrworf/katana-usb-audio](https://github.com/mrworf/katana-usb-audio) just updated (mostly by Claude so use at your own risk) to be compatible with Fedora 44 and kernel 7.1.5
+
+## Original readme follows:
+
 ## Features
 
 - ✅ Hardware volume control with mute/unmute control

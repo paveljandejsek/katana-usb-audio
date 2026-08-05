@@ -23,3 +23,7 @@ int katana_pcm_prepare(struct snd_pcm_substream *substream);
 int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
 snd_pcm_uframes_t katana_pcm_pointer(struct snd_pcm_substream *substream);
 void katana_pcm_invalidate_usb_dev(struct snd_card *card);
+
+// Power management helpers, called from the USB driver's suspend/resume paths
+void katana_pcm_suspend(struct snd_pcm *pcm);
+void katana_pcm_resume(struct snd_pcm *pcm);

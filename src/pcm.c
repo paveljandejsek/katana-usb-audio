@@ -73,14 +73,35 @@ struct katana_pcm_data {
 	unsigned long start_time;
 };
 
+/*
+ * The card exposes a single playback substream, whose private data is allocated
+ * in open() and freed in close(). Suspend and disconnect both need to reach
+ * that data from outside the PCM callbacks in order to stop URBs, so track the
+ * open substream here.
+ *
+ * katana_stream_mutex serialises those users against close(); it must never be
+ * taken from atomic context, and callers may sleep while holding it (killing
+ * URBs does sleep).
+ */
+static DEFINE_MUTEX(katana_stream_mutex);
+static struct katana_pcm_data *katana_active_stream;
+
+static void katana_kill_urbs(struct katana_pcm_data *data);
+
 // Hardware capabilities definition
 struct snd_pcm_hardware katana_pcm_playback_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		 SNDRV_PCM_INFO_INTERLEAVED |
 		 SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		 SNDRV_PCM_INFO_MMAP_VALID |
-		 SNDRV_PCM_INFO_PAUSE |
-		 SNDRV_PCM_INFO_RESUME),
+		 SNDRV_PCM_INFO_PAUSE),
+	/*
+	 * SNDRV_PCM_INFO_RESUME is deliberately not advertised. It promises that
+	 * the driver can restore a running stream across suspend, which would
+	 * require replaying the altsetting, sample rate and URB state from the
+	 * resume callback. Without it ALSA reports -ESTRPIPE to userspace and the
+	 * application re-prepares the stream, which re-runs that setup for us.
+	 */
 	.formats = SNDRV_PCM_FMTBIT_S24_3LE,  // Only packed 24-bit LE as per USB descriptor (bSubframeSize 3)
 	.rates = (SNDRV_PCM_RATE_48000 |     // Only rates supported by device
 		  SNDRV_PCM_RATE_96000),
@@ -242,20 +263,26 @@ static int katana_set_sample_rate(struct katana_pcm_data *data, unsigned int rat
 	
 	// Send SET_CUR request for sampling frequency control
 	// USB Audio Class 1.0 specification: SET_CUR request
-	// bmRequestType: 0x22 = Class request, Interface recipient, Host-to-device
+	// bmRequestType: 0x22 = Class request, Endpoint recipient, Host-to-device
 	// bRequest: 0x01 = SET_CUR
 	// wValue: (0x01 << 8) | 0x00 = Sampling Freq Control (0x01) on endpoint 0x01
 	// wIndex: 0x0100 = Interface 1, endpoint 1
-	err = usb_control_msg(data->usb_dev,
-			      usb_sndctrlpipe(data->usb_dev, 0),
-			      0x01,  // SET_CUR
-			      0x22,  // bmRequestType
-			      0x0100, // wValue: Sampling Freq Control
-			      0x0101, // wIndex: Interface 1, Endpoint 1
-			      rate_data,
-			      3,     // 3 bytes for sample rate
-			      1000); // timeout
-	
+	//
+	// usb_control_msg_send() copies the payload into a kmalloc'd bounce buffer
+	// first; rate_data lives on the stack, which usb_control_msg() would reject
+	// with -EAGAIN on any CONFIG_VMAP_STACK kernel. It returns 0 on success
+	// rather than a byte count.
+	err = usb_control_msg_send(data->usb_dev,
+				   0,     // endpoint 0
+				   0x01,  // SET_CUR
+				   0x22,  // bmRequestType
+				   0x0100, // wValue: Sampling Freq Control
+				   0x0101, // wIndex: Interface 1, Endpoint 1
+				   rate_data,
+				   3,     // 3 bytes for sample rate
+				   1000,  // timeout
+				   GFP_KERNEL);
+
 	if (err < 0) {
 		pr_err("Katana PCM: Failed to set sample rate %u: %d\n", rate, err);
 		return err;
@@ -429,22 +456,85 @@ int katana_pcm_playback_open(struct snd_pcm_substream *substream)
 			    katana_buffer_constraint, NULL,
 			    SNDRV_PCM_HW_PARAM_PERIOD_BYTES, SNDRV_PCM_HW_PARAM_PERIODS, -1);
 
+	// Publish the stream so suspend and disconnect can stop its URBs
+	mutex_lock(&katana_stream_mutex);
+	katana_active_stream = data;
+	mutex_unlock(&katana_stream_mutex);
 
 	katana_exit_operation();
 	return 0;
 }
 
+// Stop the stream and mark it as no longer usable, without freeing anything.
+// Caller must hold katana_stream_mutex. Sleeps (usb_kill_urb).
+static void katana_halt_stream(struct katana_pcm_data *data, int invalidate)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&data->lock, flags);
+	data->running = 0;
+	data->stream_started = 0;
+	if (invalidate)
+		data->usb_dev_valid = 0;
+	spin_unlock_irqrestore(&data->lock, flags);
+
+	// Must be outside the spinlock: usb_kill_urb() waits for completion
+	katana_kill_urbs(data);
+}
+
 // Invalidate USB device in PCM data (called on disconnect)
 void katana_pcm_invalidate_usb_dev(struct snd_card *card)
 {
+	struct katana_pcm_data *data;
+
 	if (!card) {
 		pr_warn("Katana PCM: Card is NULL in invalidate_usb_dev\n");
 		return;
 	}
-	
-	// Mark all PCM private data as having invalid USB devices
-	// This prevents further USB operations but allows buffer cleanup to continue
-	// The individual PCM operations will handle the invalid USB device gracefully
+
+	// Mark the open substream's USB device as gone and stop its URBs, so that
+	// nothing touches the usb_device after the card is freed. Operations that
+	// run later see usb_dev_valid == 0 and bail out with -ENODEV.
+	mutex_lock(&katana_stream_mutex);
+	data = katana_active_stream;
+	if (data && data->card == card) {
+		pr_debug("Katana PCM: Invalidating USB device for open substream\n");
+		katana_halt_stream(data, 1);
+	}
+	mutex_unlock(&katana_stream_mutex);
+}
+
+// Stop streaming ahead of a USB suspend. Safe to call with no stream open.
+void katana_pcm_suspend(struct snd_pcm *pcm)
+{
+	struct katana_pcm_data *data;
+
+	// Moves any running substream to SUSPENDED and issues trigger(SUSPEND),
+	// which unlinks the URBs. Userspace gets -ESTRPIPE and re-prepares later.
+	if (pcm)
+		snd_pcm_suspend_all(pcm);
+
+	// The unlink above is asynchronous; wait for the URBs to actually retire
+	// before the host controller loses power.
+	mutex_lock(&katana_stream_mutex);
+	data = katana_active_stream;
+	if (data)
+		katana_halt_stream(data, 0);
+	mutex_unlock(&katana_stream_mutex);
+}
+
+// Counterpart to katana_pcm_suspend(). The stream is restarted by userspace
+// re-preparing after -ESTRPIPE, so there is no URB state to restore here; the
+// altsetting and sample rate are re-applied by katana_pcm_prepare().
+void katana_pcm_resume(struct snd_pcm *pcm)
+{
+	struct katana_pcm_data *data;
+
+	mutex_lock(&katana_stream_mutex);
+	data = katana_active_stream;
+	if (data)
+		data->usb_dev_valid = 1;
+	mutex_unlock(&katana_stream_mutex);
 }
 
 // Close playback substream
@@ -456,10 +546,17 @@ int katana_pcm_playback_close(struct snd_pcm_substream *substream)
 	// We always need to be able to clean up resources
 
 	if (data) {
+		// Unpublish first, so a concurrent suspend or disconnect cannot reach
+		// this data while it is being torn down
+		mutex_lock(&katana_stream_mutex);
+		if (katana_active_stream == data)
+			katana_active_stream = NULL;
+		mutex_unlock(&katana_stream_mutex);
+
 		// Stop streaming and free URB buffers
 		data->stream_started = 0;
 		katana_free_urb_buffers(data);
-		
+
 		kfree(data);
 		substream->runtime->private_data = NULL;  // CRITICAL: Clear dangling pointer
 	}
@@ -714,6 +811,7 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		should_block = 1;  // Block new work operations
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
 		should_block = 0;  // Allow stop operations (cleanup)
 		break;
 	default:
@@ -805,17 +903,22 @@ int katana_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		break;
 		
 	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+		// SUSPEND is triggered by snd_pcm_suspend_all() from the USB suspend
+		// callback. Unlink here (this runs under the spinlock, so it must not
+		// sleep); katana_pcm_suspend() follows up with usb_kill_urb() to
+		// guarantee the URBs are dead before the host controller goes down.
 		data->running = 0;
 		data->stream_started = 0;
-		
+
 		// Stop sync URB first
 		usb_unlink_urb(data->sync_urb);
-		
+
 		// Stop URB streaming (use unlink in atomic context)
 		for (i = 0; i < data->num_urbs; i++) {
 			usb_unlink_urb(data->urbs[i]);
 		}
-		
+
 		break;
 		
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
@@ -1403,25 +1506,37 @@ error_cleanup:
 	return -ENOMEM;
 }
 
-// Free URB buffers
-static void katana_free_urb_buffers(struct katana_pcm_data *data)
+// Stop all in-flight URBs and wait for them to complete. Sleeps, so it must
+// never be called while holding data->lock.
+static void katana_kill_urbs(struct katana_pcm_data *data)
 {
 	int i;
-	
-	if (!data->urbs)
-		return;
-	
-	// Stop all URBs first (including sync URB)
+
 	if (data->sync_urb) {
 		usb_kill_urb(data->sync_urb);
 	}
-	
+
+	if (!data->urbs)
+		return;
+
 	for (i = 0; i < data->num_urbs; i++) {
 		if (data->urbs[i]) {
 			usb_kill_urb(data->urbs[i]);
 		}
 	}
-	
+}
+
+// Free URB buffers
+static void katana_free_urb_buffers(struct katana_pcm_data *data)
+{
+	int i;
+
+	if (!data->urbs)
+		return;
+
+	// Stop all URBs first (including sync URB)
+	katana_kill_urbs(data);
+
 	// Free URB resources
 	for (i = 0; i < data->num_urbs; i++) {
 		if (data->urb_buffers[i]) {

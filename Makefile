@@ -1,11 +1,16 @@
-obj-m += katana_usb_audio.o 
+obj-m += katana_usb_audio.o
 
 PWD := $(CURDIR)
-KDIR := /lib/modules/$(shell uname -r)/build
-UDEV_RULES_DIR := /etc/udev/rules.d
-MODULE_DIR := /lib/modules/$(shell uname -r)/extra
 
-katana_usb_audio-objs := src/card.o src/control.o src/pcm.o src/usb.o src/katana_usb_audio.o
+# Build against the kernel DKMS is targeting, not the running one. DKMS exports
+# KERNELRELEASE for the kernel being built for, which differs from `uname -r`
+# during a kernel upgrade (the new kernel is installed while the old one runs).
+KVER ?= $(if $(KERNELRELEASE),$(KERNELRELEASE),$(shell uname -r))
+KDIR ?= /lib/modules/$(KVER)/build
+UDEV_RULES_DIR := /etc/udev/rules.d
+MODULE_DIR := /lib/modules/$(KVER)/extra
+
+katana_usb_audio-objs := src/control.o src/pcm.o src/usb.o src/katana_usb_audio.o
 
 all:
 	make -C $(KDIR) M=$(PWD) modules
@@ -14,6 +19,15 @@ clean:
 	make -C $(KDIR) M=$(PWD) clean
 
 install: all
+	@echo "############################################################"
+	@echo "# WARNING: this installs to $(MODULE_DIR)"
+	@echo "# depmod searches extra/ BEFORE kernel/, and DKMS installs"
+	@echo "# to kernel/sound/usb/. A module left here will shadow every"
+	@echo "# future DKMS build, including rebuilds after kernel updates."
+	@echo "#"
+	@echo "# Use 'make dkms-install' instead unless you know why you"
+	@echo "# want this. To undo later: 'make uninstall'."
+	@echo "############################################################"
 	@echo "Installing Katana USB Audio driver..."
 	mkdir -p $(MODULE_DIR)
 	cp katana_usb_audio.ko $(MODULE_DIR)/

@@ -1,12 +1,59 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/printk.h>
-#include <linux/dma-mapping.h>
 #include <linux/usb.h>
 #include <sound/control.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include "control.h"
+
+// USB Audio Class 1.0 request codes
+#define UAC_SET_CUR	0x01
+#define UAC_GET_CUR	0x81
+#define UAC_GET_MIN	0x82
+#define UAC_GET_MAX	0x83
+#define UAC_GET_RES	0x84
+
+// bmRequestType for Feature Unit requests (class request, interface recipient)
+#define UAC_RT_GET	(USB_DIR_IN  | USB_TYPE_CLASS | USB_RECIP_INTERFACE)  // 0xA1
+#define UAC_RT_SET	(USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE)  // 0x21
+
+// wValue: control selector in the high byte, channel number in the low byte
+#define UAC_MUTE_CH0	0x0100	// Mute Control, channel 0 (master)
+#define UAC_VOLUME_CH1	0x0201	// Volume Control, channel 1 (left)
+#define UAC_VOLUME_CH2	0x0202	// Volume Control, channel 2 (right)
+
+// wIndex: Feature Unit ID in the high byte, interface number in the low byte
+#define UAC_FU1_IFACE0	0x0100	// Interface 0, Feature Unit 1 (speaker output)
+
+#define KATANA_CTL_TIMEOUT	1000
+
+/*
+ * usb_control_msg() maps the caller's data buffer for DMA, so that buffer must
+ * live in the kernel's direct map. Neither a stack variable (CONFIG_VMAP_STACK)
+ * nor usb_alloc_coherent() memory (vmap-remapped when an IOMMU is active)
+ * qualifies, and the HCD rejects both with -EAGAIN before the request ever
+ * reaches the device. usb_control_msg_recv()/_send() bounce through a kmalloc'd
+ * buffer internally, so an ordinary local variable is safe to pass here.
+ *
+ * Note both helpers return 0 on success, not a byte count (a short transfer is
+ * reported as -EREMOTEIO).
+ */
+static int katana_ctl_get(struct usb_device *usb_dev, __u8 request,
+			  __u16 value, void *buf, __u16 len)
+{
+	return usb_control_msg_recv(usb_dev, 0, request, UAC_RT_GET,
+				    value, UAC_FU1_IFACE0, buf, len,
+				    KATANA_CTL_TIMEOUT, GFP_KERNEL);
+}
+
+static int katana_ctl_set(struct usb_device *usb_dev, __u8 request,
+			  __u16 value, const void *buf, __u16 len)
+{
+	return usb_control_msg_send(usb_dev, 0, request, UAC_RT_SET,
+				    value, UAC_FU1_IFACE0, buf, len,
+				    KATANA_CTL_TIMEOUT, GFP_KERNEL);
+}
 
 // Global volume range variables (set once during initialization)
 static int16_t katana_vol_min = -20480;  // Default fallback
@@ -23,80 +70,45 @@ static int katana_set_hardware_mute(struct usb_device *usb_dev, int mute);
 static int katana_get_volume_range(struct usb_device *usb_dev, int16_t *min_vol, int16_t *max_vol, int16_t *res_vol)
 {
 	int err;
-	unsigned char *volume_data;
-	dma_addr_t dma_addr;
-	
-	// Allocate USB coherent memory for control transfer
-	volume_data = usb_alloc_coherent(usb_dev, 2, GFP_KERNEL, &dma_addr);
-	if (!volume_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for volume range query\n");
-		return -ENOMEM;
-	}
-	
+	unsigned char volume_data[2];
+
 	// Get MIN value
-	err = usb_control_msg(usb_dev,
-			      usb_rcvctrlpipe(usb_dev, 0),
-			      0x82,  // GET_MIN
-			      0xA1,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,
-			      1000);
-	
-	if (err >= 0) {
+	err = katana_ctl_get(usb_dev, UAC_GET_MIN, UAC_VOLUME_CH1, volume_data, 2);
+	if (err == 0) {
 		*min_vol = volume_data[0] | (volume_data[1] << 8);
 	} else {
 		pr_warn("Katana Control: Failed to get volume MIN: %d\n", err);
 		*min_vol = -20480; // fallback
 	}
-	
+
 	// Get MAX value
-	err = usb_control_msg(usb_dev,
-			      usb_rcvctrlpipe(usb_dev, 0),
-			      0x83,  // GET_MAX
-			      0xA1,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,
-			      1000);
-	
-	if (err >= 0) {
+	err = katana_ctl_get(usb_dev, UAC_GET_MAX, UAC_VOLUME_CH1, volume_data, 2);
+	if (err == 0) {
 		*max_vol = volume_data[0] | (volume_data[1] << 8);
 	} else {
 		pr_warn("Katana Control: Failed to get volume MAX: %d\n", err);
 		*max_vol = 0; // fallback
 	}
-	
+
 	// Get RES value
-	err = usb_control_msg(usb_dev,
-			      usb_rcvctrlpipe(usb_dev, 0),
-			      0x84,  // GET_RES
-			      0xA1,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,
-			      1000);
-	
-	if (err >= 0) {
+	err = katana_ctl_get(usb_dev, UAC_GET_RES, UAC_VOLUME_CH1, volume_data, 2);
+	if (err == 0 && (volume_data[0] | (volume_data[1] << 8)) != 0) {
 		*res_vol = volume_data[0] | (volume_data[1] << 8);
 	} else {
-		pr_warn("Katana Control: Failed to get volume RES: %d\n", err);
+		if (err)
+			pr_warn("Katana Control: Failed to get volume RES: %d\n", err);
 		*res_vol = 1; // fallback
 	}
-	
+
 	// Update global variables
 	katana_vol_min = *min_vol;
 	katana_vol_max = *max_vol;
 	katana_vol_res = *res_vol;
 	katana_vol_range_initialized = 1;
 	
-	pr_info("Katana Control: Volume range initialized - MIN: %d, MAX: %d, RES: %d\n", 
+	pr_info("Katana Control: Volume range initialized - MIN: %d, MAX: %d, RES: %d\n",
 		*min_vol, *max_vol, *res_vol);
-	
-	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
+
 	return 0;
 }
 
@@ -104,66 +116,32 @@ static int katana_get_volume_range(struct usb_device *usb_dev, int16_t *min_vol,
 static int katana_set_hardware_volume_raw(struct usb_device *usb_dev, int16_t volume_value)
 {
 	int err;
-	unsigned char *volume_data;
-	dma_addr_t dma_addr;
-	
+	unsigned char volume_data[2];
+
 	// Initialize volume range if not done already
 	if (!katana_vol_range_initialized) {
 		int16_t min_vol, max_vol, res_vol;
 		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
 	}
-	
-	// Allocate USB coherent memory for control transfer
-	volume_data = usb_alloc_coherent(usb_dev, 2, GFP_KERNEL, &dma_addr);
-	if (!volume_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for volume control\n");
-		return -ENOMEM;
-	}
-	
+
 	// Pack volume value into 2-byte little-endian format
 	volume_data[0] = volume_value & 0xff;
 	volume_data[1] = (volume_value >> 8) & 0xff;
-	
-	// Send SET_CUR request for volume control
-	// USB Audio Class 1.0 specification: SET_CUR request for Feature Unit
-	// bmRequestType: 0x21 = Class request, Interface recipient, Host-to-device
-	// bRequest: 0x01 = SET_CUR
-	// wValue: (0x02 << 8) | 0x01 = Volume Control (0x02) on channel 1 (left)
-	// wIndex: 0x0100 = Interface 0, Feature Unit ID 1 (speaker output)
-	err = usb_control_msg(usb_dev,
-			      usb_sndctrlpipe(usb_dev, 0),
-			      0x01,  // SET_CUR
-			      0x21,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,     // 2 bytes for volume
-			      1000); // timeout
-	
+
+	// Send SET_CUR request for volume control on channel 1 (left)
+	err = katana_ctl_set(usb_dev, UAC_SET_CUR, UAC_VOLUME_CH1, volume_data, 2);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to set hardware volume %d: %d\n", volume_value, err);
-		usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 		return err;
 	}
-	
+
 	// Also set right channel (channel 2)
-	err = usb_control_msg(usb_dev,
-			      usb_sndctrlpipe(usb_dev, 0),
-			      0x01,  // SET_CUR
-			      0x21,  // bmRequestType
-			      0x0202, // wValue: Volume Control, channel 2
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,     // 2 bytes for volume
-			      1000); // timeout
-	
+	err = katana_ctl_set(usb_dev, UAC_SET_CUR, UAC_VOLUME_CH2, volume_data, 2);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to set hardware volume right channel %d: %d\n", volume_value, err);
-		usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 		return err;
 	}
-	
-	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
+
 	return 0;
 }
 
@@ -173,50 +151,27 @@ static int katana_set_hardware_volume_raw(struct usb_device *usb_dev, int16_t vo
 static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
 {
 	int err;
-	unsigned char *volume_data;
-	dma_addr_t dma_addr;
-	
+	unsigned char volume_data[2];
+	int16_t volume_value;
+
 	// Initialize volume range if not done already
 	if (!katana_vol_range_initialized) {
 		int16_t min_vol, max_vol, res_vol;
 		katana_get_volume_range(usb_dev, &min_vol, &max_vol, &res_vol);
 	}
-	
-	// Allocate USB coherent memory for control transfer
-	volume_data = usb_alloc_coherent(usb_dev, 2, GFP_KERNEL, &dma_addr);
-	if (!volume_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for volume control\n");
-		return katana_vol_min; // Return minimum on error
-	}
-	
-	// Send GET_CUR request for volume control
-	// USB Audio Class 1.0 specification: GET_CUR request for Feature Unit
-	// bmRequestType: 0xA1 = Class request, Interface recipient, Device-to-host
-	// bRequest: 0x81 = GET_CUR
-	// wValue: (0x02 << 8) | 0x01 = Volume Control (0x02) on channel 1 (left)
-	// wIndex: 0x0100 = Interface 0, Feature Unit ID 1 (speaker output)
-	err = usb_control_msg(usb_dev,
-			      usb_rcvctrlpipe(usb_dev, 0),
-			      0x81,  // GET_CUR
-			      0xA1,  // bmRequestType
-			      0x0201, // wValue: Volume Control, channel 1
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      volume_data,
-			      2,     // 2 bytes for volume
-			      1000); // timeout
-	
+
+	// Send GET_CUR request for volume control on channel 1 (left)
+	err = katana_ctl_get(usb_dev, UAC_GET_CUR, UAC_VOLUME_CH1, volume_data, 2);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to get hardware volume: %d\n", err);
-		usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 		return katana_vol_min; // Return minimum on error
 	}
-	
+
 	// Return raw 16-bit signed volume value
-	int16_t volume_value = volume_data[0] | (volume_data[1] << 8);
-	
-	pr_debug("Katana Control: Got raw hardware volume 0x%04x (%d)\n", 
+	volume_value = volume_data[0] | (volume_data[1] << 8);
+
+	pr_debug("Katana Control: Got raw hardware volume 0x%04x (%d)\n",
 		(uint16_t)volume_value, volume_value);
-	usb_free_coherent(usb_dev, 2, volume_data, dma_addr);
 	return volume_value;
 }
 
@@ -227,42 +182,18 @@ static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
 static int katana_set_hardware_mute(struct usb_device *usb_dev, int mute)
 {
 	int err;
-	unsigned char *mute_data;
-	dma_addr_t dma_addr;
-	
-	// Allocate USB coherent memory for control transfer
-	mute_data = usb_alloc_coherent(usb_dev, 1, GFP_KERNEL, &dma_addr);
-	if (!mute_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for mute control\n");
-		return -ENOMEM;
-	}
-	
+	unsigned char mute_data;
+
 	// Convert mute value: device uses inverted logic (0 = muted, 1 = unmuted)
-	mute_data[0] = mute ? 0 : 1;
-	
-	// Send SET_CUR request for mute control
-	// USB Audio Class 1.0 specification: SET_CUR request for Feature Unit
-	// bmRequestType: 0x21 = Class request, Interface recipient, Host-to-device
-	// bRequest: 0x01 = SET_CUR
-	// wValue: (0x01 << 8) | 0x00 = Mute Control (0x01) on channel 0 (master)
-	// wIndex: 0x0100 = Interface 0, Feature Unit ID 1 (speaker output)
-	err = usb_control_msg(usb_dev,
-			      usb_sndctrlpipe(usb_dev, 0),
-			      0x01,  // SET_CUR
-			      0x21,  // bmRequestType
-			      0x0100, // wValue: Mute Control, channel 0 (master)
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      mute_data,
-			      1,     // 1 byte for mute
-			      1000); // timeout
-	
+	mute_data = mute ? 0 : 1;
+
+	// Send SET_CUR request for mute control on channel 0 (master)
+	err = katana_ctl_set(usb_dev, UAC_SET_CUR, UAC_MUTE_CH0, &mute_data, 1);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to set hardware mute %d: %d\n", mute, err);
-		usb_free_coherent(usb_dev, 1, mute_data, dma_addr);
 		return err;
 	}
-	
-	usb_free_coherent(usb_dev, 1, mute_data, dma_addr);
+
 	return 0;
 }
 
@@ -270,43 +201,19 @@ static int katana_set_hardware_mute(struct usb_device *usb_dev, int mute)
 static int katana_get_hardware_mute(struct usb_device *usb_dev)
 {
 	int err;
-	unsigned char *mute_data;
-	dma_addr_t dma_addr;
+	unsigned char mute_data;
 	int mute;
-	
-	// Allocate USB coherent memory for control transfer
-	mute_data = usb_alloc_coherent(usb_dev, 1, GFP_KERNEL, &dma_addr);
-	if (!mute_data) {
-		pr_err("Katana Control: Failed to allocate coherent memory for mute control\n");
-		return -1;
-	}
-	
-	// Send GET_CUR request for mute control
-	// USB Audio Class 1.0 specification: GET_CUR request for Feature Unit
-	// bmRequestType: 0xA1 = Class request, Interface recipient, Device-to-host
-	// bRequest: 0x81 = GET_CUR
-	// wValue: (0x01 << 8) | 0x00 = Mute Control (0x01) on channel 0 (master)
-	// wIndex: 0x0100 = Interface 0, Feature Unit ID 1 (speaker output)
-	err = usb_control_msg(usb_dev,
-			      usb_rcvctrlpipe(usb_dev, 0),
-			      0x81,  // GET_CUR
-			      0xA1,  // bmRequestType
-			      0x0100, // wValue: Mute Control, channel 0 (master)
-			      0x0100, // wIndex: Interface 0, Feature Unit 1
-			      mute_data,
-			      1,     // 1 byte for mute
-			      1000); // timeout
-	
+
+	// Send GET_CUR request for mute control on channel 0 (master)
+	err = katana_ctl_get(usb_dev, UAC_GET_CUR, UAC_MUTE_CH0, &mute_data, 1);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to get hardware mute: %d\n", err);
-		usb_free_coherent(usb_dev, 1, mute_data, dma_addr);
 		return -1; // Return error as negative value
 	}
-	
+
 	// Return mute state: device uses inverted logic (0 = muted, 1 = unmuted)
 	// Convert to ALSA standard: 1 = muted, 0 = unmuted
-	mute = mute_data[0] ? 0 : 1;
-	usb_free_coherent(usb_dev, 1, mute_data, dma_addr);
+	mute = mute_data ? 0 : 1;
 	return mute;
 }
 

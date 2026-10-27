@@ -43,9 +43,14 @@ fi
 echo "Creating source directory: $MODULE_DIR"
 mkdir -p "$MODULE_DIR"
 
-# Copy source files
+# Copy source files. Only sources: a wholesale copy of src/ would also carry
+# over .o/.cmd files from a local `make`, and DKMS copies them on into its build
+# directory with their timestamps intact. If a .c was edited since that local
+# build, the stale .o can look up to date, make skips it, and DKMS installs the
+# old code while reporting success.
 echo "Copying source files..."
-cp -r src/ "$MODULE_DIR/"
+mkdir -p "$MODULE_DIR/src"
+cp src/*.c src/*.h "$MODULE_DIR/src/"
 cp Makefile "$MODULE_DIR/"
 cp dkms.conf "$MODULE_DIR/"
 cp 99-katana-usb-audio.rules "$MODULE_DIR/"

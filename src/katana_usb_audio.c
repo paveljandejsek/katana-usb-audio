@@ -45,9 +45,33 @@ struct katana_dev {
 	int registered;
 	int bound_ifaces;
 	bool suspended;
+	bool resetting;		// between pre_reset and the first post_reset
+	bool reset_pending;	// a reset is queued but pre_reset has not run yet
 };
 
 static DEFINE_MUTEX(katana_lock);
+
+/*
+ * Recovery from a half-initialised device (see katana_ctl_health_check()).
+ *
+ * The attempt counter is module-wide rather than per device because a reset
+ * that fails outright makes the USB core re-enumerate the Katana as a new
+ * device, which would start a per-device counter from zero again and could
+ * loop forever. The window lets the next suspend cycle try afresh. Both are
+ * protected by katana_lock.
+ */
+#define KATANA_MAX_RESETS	3
+#define KATANA_RESET_WINDOW	(60 * HZ)
+
+static int katana_reset_attempts;
+static unsigned long katana_reset_window_start;
+
+// Test hook: make the next N health checks fail, to exercise the recovery
+// path without waiting for the device to come back broken from suspend.
+static int simulate_unhealthy;
+module_param(simulate_unhealthy, int, 0644);
+MODULE_PARM_DESC(simulate_unhealthy,
+		 "Testing only: report the next N device health checks as failed");
 
 static const int katana_ifaces[] = {
 	AUDIO_CONTROL_IFACE_ID,
@@ -123,12 +147,80 @@ static struct katana_dev *katana_find_dev(struct usb_interface *iface,
 	return NULL;
 }
 
-// Tear down state created by katana_dev_create(). Caller must hold katana_lock.
+// Tear down state created by katana_usb_probe(). Caller must hold katana_lock.
 static void katana_dev_destroy(struct katana_dev *kdev)
 {
 	if (kdev->card)
 		snd_card_free(kdev->card);
 	kfree(kdev);
+}
+
+static int katana_health_check(struct katana_dev *kdev)
+{
+	if (simulate_unhealthy > 0) {
+		simulate_unhealthy--;
+		return -EPROTO;
+	}
+	return katana_ctl_health_check(kdev->udev);
+}
+
+/*
+ * Register the card once both interfaces are bound - but only if the device is
+ * actually answering. If it came back half-initialised, registering it anyway
+ * makes PipeWire probe it immediately, fail, and remember it as "Pro Audio"
+ * only. Instead, hold the card back and queue a USB reset, which brings the
+ * device up properly; post_reset() then calls back in here to try again.
+ *
+ * Returns 0 when the card was registered or deliberately deferred, or the
+ * error from snd_card_register(). Caller must hold katana_lock.
+ */
+static int katana_try_register(struct katana_dev *kdev, struct usb_interface *iface)
+{
+	int err;
+
+	if (kdev->registered || !kdev->control_ready || !kdev->stream_ready)
+		return 0;
+
+	// A reset is already on its way; post_reset() will be back
+	if (kdev->reset_pending)
+		return 0;
+
+	err = katana_health_check(kdev);
+	if (err == 0) {
+		katana_reset_attempts = 0;
+	} else {
+		if (time_after(jiffies, katana_reset_window_start + KATANA_RESET_WINDOW)) {
+			katana_reset_window_start = jiffies;
+			katana_reset_attempts = 0;
+		}
+
+		if (katana_reset_attempts < KATANA_MAX_RESETS) {
+			katana_reset_attempts++;
+			dev_warn(&iface->dev,
+				 "Device not answering control requests (%d), resetting it (attempt %d/%d)\n",
+				 err, katana_reset_attempts, KATANA_MAX_RESETS);
+			kdev->reset_pending = true;
+			// Asynchronous: usb_reset_device() cannot be called from probe or
+			// from inside another reset's post_reset callback
+			usb_queue_reset_device(iface);
+			return 0;
+		}
+
+		// Out of attempts. Register anyway so the card is at least visible
+		// and the problem is reported, rather than silently missing.
+		dev_err(&iface->dev,
+			"Device still not answering after %d resets (%d). Power-cycle the soundbar to recover.\n",
+			KATANA_MAX_RESETS, err);
+	}
+
+	err = snd_card_register(kdev->card);
+	if (err != 0) {
+		dev_err(&iface->dev, "ALSA card registration failed: %d\n", err);
+		return err;
+	}
+	kdev->registered = 1;
+	dev_info(&iface->dev, "ALSA card registered successfully with all components\n");
+	return 0;
 }
 
 static int katana_usb_probe(struct usb_interface *iface, const struct usb_device_id *id)
@@ -252,17 +344,16 @@ static int katana_usb_probe(struct usb_interface *iface, const struct usb_device
 	usb_set_intfdata(iface, kdev);
 	kdev->bound_ifaces++;
 
-	// Register the card only after both interfaces are ready
-	if (kdev->control_ready && kdev->stream_ready && !kdev->registered) {
-		err = snd_card_register(kdev->card);
+	// Register the card only after both interfaces are ready, and only once the
+	// device is answering. On success the interface must stay bound even if
+	// registration was deferred, because the queued reset is tied to it.
+	if (kdev->control_ready && kdev->stream_ready) {
+		err = katana_try_register(kdev, iface);
 		if (err != 0) {
-			dev_err(&iface->dev, "ALSA card registration failed: %d\n", err);
 			usb_set_intfdata(iface, NULL);
 			kdev->bound_ifaces--;
 			goto __error_dev;
 		}
-		kdev->registered = 1;
-		dev_info(&iface->dev, "ALSA card registered successfully with all components\n");
 	} else if (!kdev->registered) {
 		dev_info(&iface->dev, "Interface %d processed, waiting for other interface...\n", ifnum);
 	}
@@ -341,6 +432,30 @@ static void katana_usb_disconnect(struct usb_interface *iface)
 }
 
 /*
+ * Stop all traffic to the device: suspend any running substream (userspace
+ * gets -ESTRPIPE and re-prepares later), wait for every URB to retire, and move
+ * the card to D3hot, which makes ALSA hold PCM and mixer ioctls until D0 so
+ * nothing new is submitted meanwhile. Shared by system suspend and USB reset.
+ * Caller must hold katana_lock.
+ */
+static void katana_quiesce(struct katana_dev *kdev)
+{
+	katana_pcm_suspend(kdev->pcm);
+
+	if (kdev->card)
+		snd_power_change_state(kdev->card, SNDRV_CTL_POWER_D3hot);
+}
+
+// Undo katana_quiesce(). Caller must hold katana_lock.
+static void katana_unquiesce(struct katana_dev *kdev)
+{
+	katana_pcm_resume(kdev->pcm);
+
+	if (kdev->card)
+		snd_power_change_state(kdev->card, SNDRV_CTL_POWER_D0);
+}
+
+/*
  * Power management.
  *
  * All three callbacks run once per bound interface, so each guards on
@@ -361,10 +476,7 @@ static int katana_usb_suspend(struct usb_interface *iface, pm_message_t message)
 
 		// Stop the stream and wait for every URB to retire before the host
 		// controller powers down
-		katana_pcm_suspend(kdev->pcm);
-
-		if (kdev->card)
-			snd_power_change_state(kdev->card, SNDRV_CTL_POWER_D3hot);
+		katana_quiesce(kdev);
 
 		dev_info(&iface->dev, "Suspended\n");
 	}
@@ -384,13 +496,69 @@ static int katana_usb_resume(struct usb_interface *iface)
 	if (kdev->suspended) {
 		kdev->suspended = false;
 
-		katana_pcm_resume(kdev->pcm);
-
-		if (kdev->card)
-			snd_power_change_state(kdev->card, SNDRV_CTL_POWER_D0);
+		katana_unquiesce(kdev);
 
 		dev_info(&iface->dev, "Resumed\n");
 	}
+	mutex_unlock(&katana_lock);
+
+	return 0;
+}
+
+/*
+ * USB reset handling.
+ *
+ * Without these two callbacks the USB core unbinds the driver before a reset
+ * and re-matches the interfaces afterwards. That re-match is not an "add"
+ * event, so the udev rule never fires and snd-usb-audio takes the device -
+ * which is exactly what a manual `usbreset` used to do, and what would undo
+ * the automatic recovery in katana_try_register().
+ *
+ * Like the PM callbacks, both run once per bound interface; kdev->resetting
+ * makes the work happen once per reset.
+ */
+static int katana_usb_pre_reset(struct usb_interface *iface)
+{
+	struct katana_dev *kdev = usb_get_intfdata(iface);
+
+	if (!kdev)
+		return 0;
+
+	mutex_lock(&katana_lock);
+	kdev->reset_pending = false;
+	if (!kdev->resetting) {
+		kdev->resetting = true;
+
+		// No URBs may be in flight or submitted until post_reset
+		katana_quiesce(kdev);
+
+		dev_info(&iface->dev, "Device reset starting\n");
+	}
+	mutex_unlock(&katana_lock);
+
+	return 0;
+}
+
+static int katana_usb_post_reset(struct usb_interface *iface)
+{
+	struct katana_dev *kdev = usb_get_intfdata(iface);
+
+	if (!kdev)
+		return 0;
+
+	mutex_lock(&katana_lock);
+	if (kdev->resetting) {
+		kdev->resetting = false;
+
+		katana_unquiesce(kdev);
+
+		dev_info(&iface->dev, "Device reset complete\n");
+	}
+
+	// If registration was held back because the device was not answering,
+	// check it again now. A no-op once the card is registered. The error is
+	// already logged, and post_reset has no way to fail the reset over it.
+	katana_try_register(kdev, iface);
 	mutex_unlock(&katana_lock);
 
 	return 0;
@@ -418,6 +586,8 @@ static struct usb_driver usb_ac_driver = {
 	.suspend      = katana_usb_suspend,    // Stop streaming before the bus goes down
 	.resume	      = katana_usb_resume,     // Bus came back with the device still configured
 	.reset_resume = katana_usb_reset_resume, // Device lost power and was reset
+	.pre_reset    = katana_usb_pre_reset,  // Stay bound across a USB reset...
+	.post_reset   = katana_usb_post_reset, // ...instead of being unbound and re-matched
 	.id_table     = usb_table,	       // Required or the driver's probe will never get called
 	// .supports_autosuspend is intentionally left unset - runtime PM is not implemented
 };

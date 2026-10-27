@@ -147,8 +147,8 @@ static int katana_set_hardware_volume_raw(struct usb_device *usb_dev, int16_t vo
 
 // Removed unused percentage-based volume control function
 
-// Get raw hardware volume value (not percentage)
-static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
+// Get raw hardware volume value (not percentage). Returns 0 or a negative error.
+static int katana_get_hardware_volume_raw(struct usb_device *usb_dev, int16_t *volume)
 {
 	int err;
 	unsigned char volume_data[2];
@@ -164,15 +164,16 @@ static int16_t katana_get_hardware_volume_raw(struct usb_device *usb_dev)
 	err = katana_ctl_get(usb_dev, UAC_GET_CUR, UAC_VOLUME_CH1, volume_data, 2);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to get hardware volume: %d\n", err);
-		return katana_vol_min; // Return minimum on error
+		return err;
 	}
 
-	// Return raw 16-bit signed volume value
+	// Raw 16-bit signed volume value
 	volume_value = volume_data[0] | (volume_data[1] << 8);
 
 	pr_debug("Katana Control: Got raw hardware volume 0x%04x (%d)\n",
 		(uint16_t)volume_value, volume_value);
-	return volume_value;
+	*volume = volume_value;
+	return 0;
 }
 
 // Get hardware volume using USB Audio Class control requests (returns percentage)
@@ -208,13 +209,29 @@ static int katana_get_hardware_mute(struct usb_device *usb_dev)
 	err = katana_ctl_get(usb_dev, UAC_GET_CUR, UAC_MUTE_CH0, &mute_data, 1);
 	if (err < 0) {
 		pr_err("Katana Control: Failed to get hardware mute: %d\n", err);
-		return -1; // Return error as negative value
+		return err;
 	}
 
 	// Return mute state: device uses inverted logic (0 = muted, 1 = unmuted)
 	// Convert to ALSA standard: 1 = muted, 0 = unmuted
 	mute = mute_data ? 0 : 1;
 	return mute;
+}
+
+/*
+ * Check that the device answers class requests on its control interface.
+ *
+ * After the host controller loses power across suspend, the Katana sometimes
+ * re-enumerates with its firmware only half up: standard enumeration succeeds,
+ * but every class or interface request fails with -EPROTO, for this driver,
+ * snd-usb-audio and usbhid alike. It stays in that state until it is reset.
+ * A harmless GET_CUR of the master mute is enough to tell the two states apart.
+ */
+int katana_ctl_health_check(struct usb_device *usb_dev)
+{
+	unsigned char mute_data;
+
+	return katana_ctl_get(usb_dev, UAC_GET_CUR, UAC_MUTE_CH0, &mute_data, 1);
 }
 
 // Helper function to get USB device from control
@@ -236,15 +253,17 @@ int katana_volume_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucon
 		return 0;
 	}
 	
-	// Get raw volume from device
-	int16_t raw_volume = katana_get_hardware_volume_raw(usb_dev);
-	if (raw_volume < katana_vol_min) {
-		ucontrol->value.integer.value[0] = 0; // Default on error
-		return 0;
-	}
-	
+	// Get raw volume from device. Report a failed read as an error rather than
+	// inventing a value, so userspace does not mistake it for the real level.
+	int16_t raw_volume;
+	int err = katana_get_hardware_volume_raw(usb_dev, &raw_volume);
+	if (err < 0)
+		return err;
+
 	// Convert raw volume to ALSA steps
 	int alsa_steps = (raw_volume - katana_vol_min) / katana_vol_res;
+	if (alsa_steps < 0)
+		alsa_steps = 0;
 	
 	ucontrol->value.integer.value[0] = alsa_steps;
 	pr_debug("Katana Control: Volume get - %d steps (raw: %d)\n", alsa_steps, raw_volume);
@@ -319,11 +338,11 @@ int katana_mute_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontr
 		return 0;
 	}
 	
+	// Report a failed read as an error rather than a made-up switch state
 	int mute = katana_get_hardware_mute(usb_dev);
-	if (mute < 0) {
-		mute = 1; // Default on error
-	}
-	
+	if (mute < 0)
+		return mute;
+
 	ucontrol->value.integer.value[0] = mute;
 	pr_debug("Katana Control: Mute get - %d\n", mute);
 	return 0;
